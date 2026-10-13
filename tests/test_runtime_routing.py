@@ -1,4 +1,5 @@
 import copy
+import http.client
 import importlib.util
 import io
 import json
@@ -8,16 +9,19 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, IncompleteReadError, ResponseStreamingError
+from botocore.response import StreamingBody
+from urllib3.response import HTTPResponse
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lambda/shared/python"))
 import runtime_routing as routing
 from runtime_invocation import (
-    RELEASE_RESERVE_SECONDS, InvocationDeadlineExceeded, invoke_bounded,
+    RELEASE_RESERVE_SECONDS, InvocationDeadlineExceeded, InvocationTransportError, invoke_bounded,
 )
 
 ARN = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/legacy-123"
@@ -702,3 +706,135 @@ def test_bounded_response_closes_body_and_client_and_configures_sdk_without_retr
     result = invoke_bounded(lambda **kwargs: Runtime(), {}, time.monotonic() + 7)
     assert json.loads(result[1]) == {"response": "done"}
     assert closed.wait(timeout=1) and body.closed
+
+
+@pytest.fixture
+def sdk_body():
+    bodies = []
+
+    def make(content, headers=None, enforce_content_length=True):
+        headers = {"Content-Length": str(len(content))} if headers is None else headers
+        wire = b"HTTP/1.1 200 OK\r\n" + b"".join(
+            f"{key}: {value}\r\n".encode() for key, value in headers.items()
+        ) + b"\r\n" + content
+
+        class Socket:
+            def __init__(self):
+                self.timeouts = []
+
+            def makefile(self, mode):
+                raw = io.BytesIO(wire)
+                raw._sock = self
+                return io.BufferedReader(raw)
+
+            def settimeout(self, timeout):
+                self.timeouts.append(timeout)
+
+        sock = Socket()
+        response = http.client.HTTPResponse(sock)
+        response.begin()
+        # Use the SDK's HTTP stack with an in-memory socket; EOF clears response.fp.
+        raw = HTTPResponse(
+            body=response, headers=dict(response.getheaders()), preload_content=False,
+            decode_content=False, enforce_content_length=enforce_content_length,
+        )
+        body = StreamingBody(raw, response.getheader("Content-Length"))
+        bodies.append(body)
+        return body, sock
+
+    yield make
+    for body in bodies:
+        body.close()
+
+
+@pytest.mark.parametrize("size", [0, 5, 65536, 65537])
+@pytest.mark.parametrize("framing", ["length", "chunked", "close"])
+def test_bounded_sdk_response_reads_through_eof(sdk_body, size, framing):
+    content = b"x" * size
+    wire, headers = content, None if framing == "length" else {}
+    if framing == "chunked":
+        wire = (f"{size:x}\r\n".encode() + content + b"\r\n" if size else b"") + b"0\r\n\r\n"
+        headers = {"Transfer-Encoding": "chunked"}
+    body, sock = sdk_body(wire, headers)
+    runtime = SimpleNamespace(invoke_agent_runtime=lambda **kwargs: {"response": body})
+    assert invoke_bounded(lambda **kwargs: runtime, {}, time.monotonic() + 7) == (200, content)
+    assert body._raw_stream.closed and body._raw_stream._fp.fp is None
+    assert sock.timeouts and all(0 < timeout <= 1 for timeout in sock.timeouts)
+    assert sock.timeouts == sorted(sock.timeouts, reverse=True)
+
+
+@pytest.mark.parametrize("closed", [False, True], ids=["truncated", "disconnected"])
+@pytest.mark.parametrize("enforce", [False, True], ids=["botocore-validation", "urllib3-validation"])
+def test_bounded_sdk_incomplete_response_retains_admission(sdk_body, closed, enforce):
+    body, _ = sdk_body(b"partial", {"Content-Length": "20"}, enforce)
+    if closed:
+        assert body.read(3) == b"par"
+        body._raw_stream.close()
+    runtime = SimpleNamespace(invoke_agent_runtime=lambda **kwargs: {"response": body})
+    table = FakeTable(candidate())
+    with pytest.raises(InvocationTransportError) as caught:
+        with routing.admit_route(table, resolve(table), USER, ACTOR):
+            invoke_bounded(lambda **kwargs: runtime, {}, time.monotonic() + 7)
+    assert isinstance(caught.value.__cause__, ResponseStreamingError if enforce else IncompleteReadError)
+    assert caught.value.retain_admission is True
+    assert table.items[(f"USER#{USER}", "SESSION")]["inFlight"] == 1
+
+
+@pytest.mark.parametrize("limit", [65536, 500_000])
+@pytest.mark.parametrize("extra", [0, 1], ids=["exact-limit", "over-limit"])
+def test_bounded_sdk_response_preserves_size_limit(sdk_body, limit, extra):
+    content = b"x" * (limit + extra)
+    body, _ = sdk_body(content)
+    runtime = SimpleNamespace(invoke_agent_runtime=lambda **kwargs: {"response": body})
+    table = FakeTable(candidate())
+
+    def invoke():
+        with routing.admit_route(table, resolve(table), USER, ACTOR):
+            return invoke_bounded(lambda **kwargs: runtime, {}, time.monotonic() + 7, limit)
+
+    if extra:
+        with pytest.raises(InvocationTransportError, match="exceeds size limit") as caught:
+            invoke()
+        assert isinstance(caught.value.__cause__, ValueError) and caught.value.retain_admission
+    else:
+        assert invoke() == (200, content)
+    assert table.items[(f"USER#{USER}", "SESSION")]["inFlight"] == extra
+
+
+def test_bounded_sdk_socket_attribute_error_is_not_eof(sdk_body):
+    body, sock = sdk_body(b"ready")
+    runtime = SimpleNamespace(invoke_agent_runtime=lambda **kwargs: {"response": body})
+    error = AttributeError("unexpected socket interface")
+    with patch.object(sock, "settimeout", side_effect=error), patch.object(body, "read") as read:
+        with pytest.raises(InvocationTransportError) as caught:
+            invoke_bounded(lambda **kwargs: runtime, {}, time.monotonic() + 7)
+    assert caught.value.__cause__ is error and caught.value.retain_admission
+    read.assert_not_called()
+
+
+@pytest.mark.parametrize("result", [{"response": "done"}, {"status": "unknown_outcome"}, None])
+def test_cron_sdk_warmup_reaches_execution_and_preserves_admission(sdk_body, result):
+    module = load_lambda("cron")
+    table = module.identity_table = cron_table()
+    responses = [
+        sdk_body(json.dumps({"status": "ready", "phase": "USER_READY"}).encode())[0],
+        sdk_body(json.dumps(result).encode() if result is not None else b"")[0],
+    ]
+    calls = []
+
+    class Runtime:
+        def invoke_agent_runtime(self, **kwargs):
+            calls.append(json.loads(kwargs["payload"])["action"])
+            return {"response": responses.pop(0)}
+
+    module.runtime_client_factory = lambda **kwargs: Runtime()
+    with patch.object(module, "deliver_response") as deliver:
+        assert module.handler(cron_event(), None)["statusCode"] == (200 if result == {"response": "done"} else 503)
+    assert calls == ["warmup", "cron"]
+    record = table.items[(f"USER#{USER}", "SESSION")]
+    if result == {"response": "done"}:
+        deliver.assert_called_once_with("telegram", "123", "done")
+        assert record["inFlight"] == 0 and "activeAdmissions" not in record
+    else:
+        deliver.assert_not_called()
+        assert record["inFlight"] == 1 and len(record["activeAdmissions"]) == 1

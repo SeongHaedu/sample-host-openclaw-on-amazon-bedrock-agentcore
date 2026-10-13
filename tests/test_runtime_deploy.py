@@ -134,6 +134,48 @@ class FakeCreateNetworkReadback(FakeControl):
         return created
 
 
+class FakeEndpointReadback(FakeControl):
+    def __init__(self):
+        super().__init__()
+        self.endpoint_readbacks = []
+        self.interrupt_endpoint = None
+
+    def get_agent_runtime_endpoint(self, **kwargs):
+        if self.endpoint_readbacks:
+            self.calls.append(("get-endpoint", kwargs))
+            observation = self.endpoint_readbacks.pop(0)
+            if isinstance(observation, Exception):
+                raise observation
+            self.endpoint = copy.deepcopy(observation)
+            return copy.deepcopy(self.endpoint)
+        return super().get_agent_runtime_endpoint(**kwargs)
+
+    def create_agent_runtime_endpoint(self, **kwargs):
+        result = super().create_agent_runtime_endpoint(**kwargs)
+        if kwargs["name"] == self.interrupt_endpoint:
+            self.endpoint["status"] = "CREATING"
+            self.endpoint.pop("liveVersion")
+            raise KeyboardInterrupt("deployment interrupted after endpoint creation")
+        return result
+
+
+@pytest.fixture
+def endpoint_clock(monkeypatch):
+    state = SimpleNamespace(now=0, sleeps=[])
+    original_wait = deploy.wait_endpoint
+
+    def sleep(seconds):
+        state.sleeps.append(seconds)
+        state.now += seconds
+
+    def wait(*args, **kwargs):
+        return original_wait(*args, **kwargs, sleep=sleep, clock=lambda: state.now)
+
+    monkeypatch.setattr(deploy, "wait_endpoint", wait)
+    monkeypatch.setattr(deploy, "time", SimpleNamespace(monotonic=lambda: state.now, sleep=sleep))
+    return state
+
+
 class FakeInvoke:
     def __init__(self, body=None, status=200):
         self.body = body
@@ -459,6 +501,304 @@ def test_same_deployment_is_idempotent_without_second_warmup(tmp_path):
     assert len(invoke.calls) == 1
 
 
+@pytest.mark.parametrize("operation", ["create", "update", "endpoint"])
+@pytest.mark.parametrize("status", ["CREATING", "UPDATING", "READY"])
+def test_interrupted_endpoint_retry_resumes_same_release(
+        tmp_path, monkeypatch, endpoint_clock, operation, status):
+    client, invoke = FakeEndpointReadback(), FakeInvoke()
+    endpoint_name = "release_1" if operation == "create" else "release_2"
+    overrides = {
+        "create": configuration(), "update": {"description": "second release"}, "endpoint": {},
+    }[operation]
+    if operation != "create":
+        perform_deploy(tmp_path, client, invoke)
+    old_endpoints = copy.deepcopy(client.endpoints)
+    invoke.calls.clear()
+    client.interrupt_endpoint = endpoint_name
+    with pytest.raises(KeyboardInterrupt, match="interrupted"):
+        perform_deploy(tmp_path, client, invoke, endpoint_name=endpoint_name, overrides=overrides)
+
+    path = tmp_path / "runtime-v2.json"
+    pending = deploy.load_manifest(path)
+    assert pending["warmup"]["status"] == "pending"
+    assert not invoke.calls
+    version = pending["agentRuntimeVersion"]
+    ready = dict(client.endpoint, status="READY", liveVersion=version)
+    observation = dict(ready, status=status)
+    if status != "READY":
+        observation.pop("liveVersion")
+    client.endpoint_readbacks = [observation, observation, ready]
+    client.calls.clear()
+    original_write = deploy.write_manifest
+
+    def write_after_ready(path, manifest):
+        assert client.endpoint["status"] == "READY"
+        original_write(path, manifest)
+
+    monkeypatch.setattr(deploy, "write_manifest", write_after_ready)
+    resumed = perform_deploy(tmp_path, client, invoke, endpoint_name=None,
+                             overrides=overrides, timeout=20)
+    assert resumed["endpointName"] == endpoint_name
+    assert resumed["agentRuntimeVersion"] == version
+    assert resumed["configurationHash"] == pending["configurationHash"]
+    assert resumed["warmup"]["status"] == "succeeded"
+    assert all(op in {"get", "get-endpoint"} for op, _ in client.calls)
+    assert len(invoke.calls) == 1
+    assert invoke.calls[0]["qualifier"] == endpoint_name
+    for name, old_endpoint in old_endpoints.items():
+        assert client.endpoints[name] == old_endpoint
+    deploy.verify_manifest(client, resumed, "us-west-2", require_enrollment_ready=True)
+
+
+@pytest.mark.parametrize("status", ["CREATING", "UPDATING", "READY"])
+@pytest.mark.parametrize("conflict", ["name", "targetVersion", "liveVersion", "configuration"])
+def test_endpoint_retry_rejects_conflicting_release_before_writes(
+        tmp_path, endpoint_clock, status, conflict):
+    client, invoke = FakeEndpointReadback(), FakeInvoke()
+    perform_deploy(tmp_path, client, invoke)
+    original = (tmp_path / "runtime-v2.json").read_bytes()
+    observation = dict(client.endpoint, status=status)
+    overrides = {}
+    if conflict == "configuration":
+        overrides = {"environmentVariables": {"KEEP_ME": "changed-secret"}}
+    else:
+        observation[conflict] = "other_release" if conflict == "name" else "999"
+    client.endpoint_readbacks = [observation]
+    client.calls.clear()
+    invoke.calls.clear()
+    with pytest.raises(deploy.DeploymentError, match="immutable") as error:
+        perform_deploy(tmp_path, client, invoke, overrides=overrides)
+    assert "changed-secret" not in str(error.value)
+    assert all(op in {"get", "get-endpoint"} for op, _ in client.calls)
+    assert not invoke.calls
+    assert not endpoint_clock.sleeps
+    assert (tmp_path / "runtime-v2.json").read_bytes() == original
+
+
+@pytest.mark.parametrize("status", ["CREATE_FAILED", "UPDATE_FAILED", "DELETING", "DELETED", "UNKNOWN"])
+@pytest.mark.parametrize("during_wait", [False, True])
+def test_endpoint_retry_failure_preserves_previous_manifest(
+        tmp_path, endpoint_clock, status, during_wait):
+    client, invoke = FakeEndpointReadback(), FakeInvoke()
+    perform_deploy(tmp_path, client, invoke)
+    original = (tmp_path / "runtime-v2.json").read_bytes()
+    failed = dict(client.endpoint, status=status)
+    client.endpoint_readbacks = ([dict(client.endpoint, status="CREATING")] if during_wait else []) + [failed]
+    client.calls.clear()
+    invoke.calls.clear()
+    with pytest.raises(deploy.DeploymentError, match=status):
+        perform_deploy(tmp_path, client, invoke, overrides={})
+    assert all(op in {"get", "get-endpoint"} for op, _ in client.calls)
+    assert not invoke.calls
+    assert (tmp_path / "runtime-v2.json").read_bytes() == original
+
+
+@pytest.mark.parametrize("status", ["CREATING", "UPDATING", "READY"])
+def test_endpoint_retry_timeout_preserves_previous_manifest(tmp_path, endpoint_clock, status):
+    client, invoke = FakeEndpointReadback(), FakeInvoke()
+    perform_deploy(tmp_path, client, invoke)
+    original = (tmp_path / "runtime-v2.json").read_bytes()
+    client.endpoint["status"] = status
+    client.endpoint.pop("liveVersion")
+    client.calls.clear()
+    invoke.calls.clear()
+    with pytest.raises(deploy.DeploymentError, match="timed out"):
+        perform_deploy(tmp_path, client, invoke, overrides={}, timeout=1)
+    assert endpoint_clock.sleeps == [1]
+    assert all(op in {"get", "get-endpoint"} for op, _ in client.calls)
+    assert not invoke.calls
+    assert (tmp_path / "runtime-v2.json").read_bytes() == original
+
+
+@pytest.mark.parametrize("outcome", ["ready", "conflict", "failure", "timeout"])
+def test_endpoint_retry_rechecks_after_preflight_without_losing_manifest(
+        tmp_path, monkeypatch, endpoint_clock, outcome):
+    client, invoke = FakeEndpointReadback(), FakeInvoke()
+    previous = perform_deploy(tmp_path, client, invoke)
+    path = tmp_path / "runtime-v2.json"
+    original = path.read_bytes()
+    ready = copy.deepcopy(client.endpoint)
+    pending = dict(ready, status="UPDATING")
+    pending.pop("liveVersion")
+    # Preflight succeeds; a subsequent observation still needs to be checked.
+    client.endpoint_readbacks = [ready, pending]
+    if outcome == "ready":
+        client.endpoint_readbacks += [pending, ready]
+    elif outcome == "conflict":
+        client.endpoint_readbacks.append(dict(pending, targetVersion="999"))
+    elif outcome == "failure":
+        client.endpoint_readbacks.append(dict(pending, status="UPDATE_FAILED"))
+    client.calls.clear()
+    invoke.calls.clear()
+    original_write = deploy.write_manifest
+
+    def write_after_ready(path, manifest):
+        assert client.endpoint["status"] == "READY"
+        original_write(path, manifest)
+
+    monkeypatch.setattr(deploy, "write_manifest", write_after_ready)
+    if outcome == "ready":
+        resumed = perform_deploy(tmp_path, client, invoke, overrides={}, timeout=20)
+        assert resumed["warmup"] == previous["warmup"]
+        assert resumed["agentRuntimeVersion"] == previous["agentRuntimeVersion"]
+    else:
+        message = {"conflict": "immutable", "failure": "UPDATE_FAILED", "timeout": "timed out"}[outcome]
+        with pytest.raises(deploy.DeploymentError, match=message):
+            perform_deploy(tmp_path, client, invoke, overrides={}, timeout=1)
+        assert path.read_bytes() == original
+        if outcome == "timeout":
+            assert endpoint_clock.sleeps == [1]
+    assert all(op in {"get", "get-endpoint"} for op, _ in client.calls)
+    assert not invoke.calls
+
+
+@pytest.mark.parametrize("field", ["targetVersion", "liveVersion"])
+def test_ensure_pending_endpoint_never_waits_for_another_release(endpoint_clock, field):
+    client = FakeEndpointReadback()
+    client.endpoint = {"name": "release_1", "status": "CREATING",
+                       "targetVersion": "2", "liveVersion": "2"}
+    client.endpoint[field] = "1"
+    with pytest.raises(deploy.DeploymentError, match="immutable"):
+        deploy.ensure_endpoint(client, client.current["agentRuntimeId"], "release_1", "2", timeout=1)
+    assert not endpoint_clock.sleeps
+    assert all(op == "get-endpoint" for op, _ in client.calls)
+
+
+@pytest.mark.parametrize("status", ["CREATING", "UPDATING"])
+def test_ensure_endpoint_waits_for_missing_version_readback(endpoint_clock, status):
+    client = FakeEndpointReadback()
+    ready = {"name": "release_1", "status": "READY", "targetVersion": "1", "liveVersion": "1"}
+    client.endpoint_readbacks = [{"name": "release_1", "status": status}, ready]
+    result = deploy.ensure_endpoint(client, client.current["agentRuntimeId"], "release_1", "1",
+                                    timeout=2, interval=1)
+    assert result == ready
+    assert endpoint_clock.sleeps == [1]
+    assert all(op == "get-endpoint" for op, _ in client.calls)
+
+
+def test_ensure_endpoint_state_changes_share_one_deadline(endpoint_clock):
+    client = FakeEndpointReadback()
+    endpoint = {"name": "release_1", "targetVersion": "1", "liveVersion": "1"}
+    client.endpoint_readbacks = [
+        dict(endpoint, status=status) for status in ("CREATING", "UPDATING", "CREATING", "READY")
+    ]
+    with pytest.raises(deploy.DeploymentError, match="timed out"):
+        deploy.ensure_endpoint(client, client.current["agentRuntimeId"], "release_1", "1",
+                               timeout=2, interval=1)
+    assert endpoint_clock.sleeps == [1, 1]
+    assert client.endpoint_readbacks == [dict(endpoint, status="READY")]
+    assert all(op == "get-endpoint" for op, _ in client.calls)
+
+
+@pytest.mark.parametrize("failure", ["runtime_network", "endpoint_updating"])
+def test_endpoint_retry_final_readback_failure_preserves_cached_warmup(
+        tmp_path, monkeypatch, endpoint_clock, failure):
+    client, invoke = FakeEndpointReadback(), FakeInvoke()
+    perform_deploy(tmp_path, client, invoke)
+    path = tmp_path / "runtime-v2.json"
+    original = path.read_bytes()
+    if failure == "runtime_network":
+        original_get = client.get_agent_runtime
+
+        def fail_final_readback(**kwargs):
+            if "agentRuntimeVersion" in kwargs:
+                client.calls.append(("get", kwargs))
+                raise ReadTimeoutError(endpoint_url="https://example.invalid")
+            return original_get(**kwargs)
+
+        monkeypatch.setattr(client, "get_agent_runtime", fail_final_readback)
+        expected_error = ReadTimeoutError
+    else:
+        ready = copy.deepcopy(client.endpoint)
+        client.endpoint_readbacks = [ready, ready, dict(ready, status="UPDATING")]
+        expected_error = deploy.DeploymentError
+    client.calls.clear()
+    invoke.calls.clear()
+    with pytest.raises(expected_error):
+        perform_deploy(tmp_path, client, invoke, overrides={})
+    assert path.read_bytes() == original
+    assert not invoke.calls
+    assert all(op in {"get", "get-endpoint"} for op, _ in client.calls)
+
+
+def test_endpoint_retry_previously_observed_endpoint_is_never_recreated(tmp_path, endpoint_clock):
+    client, invoke = FakeEndpointReadback(), FakeInvoke()
+    perform_deploy(tmp_path, client, invoke)
+    path = tmp_path / "runtime-v2.json"
+    original = path.read_bytes()
+    client.endpoint_readbacks = [
+        copy.deepcopy(client.endpoint),
+        ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "GetAgentRuntimeEndpoint"),
+    ]
+    client.calls.clear()
+    invoke.calls.clear()
+    with pytest.raises(deploy.DeploymentError, match="previously observed endpoint"):
+        perform_deploy(tmp_path, client, invoke, overrides={})
+    assert path.read_bytes() == original
+    assert not invoke.calls
+    assert all(op in {"get", "get-endpoint"} for op, _ in client.calls)
+
+
+def test_endpoint_retry_preflight_and_ensure_share_deadline(tmp_path, endpoint_clock):
+    client, invoke = FakeEndpointReadback(), FakeInvoke()
+    perform_deploy(tmp_path, client, invoke)
+    path = tmp_path / "runtime-v2.json"
+    original = path.read_bytes()
+    ready = copy.deepcopy(client.endpoint)
+    client.endpoint_readbacks = [
+        dict(ready, status="CREATING"), ready, dict(ready, status="UPDATING"), ready,
+    ]
+    client.calls.clear()
+    invoke.calls.clear()
+    with pytest.raises(deploy.DeploymentError, match="timed out"):
+        perform_deploy(tmp_path, client, invoke, overrides={}, timeout=8)
+    assert endpoint_clock.now == 8
+    assert endpoint_clock.sleeps == [5, 3]
+    assert path.read_bytes() == original
+    assert not invoke.calls
+    assert all(op in {"get", "get-endpoint"} for op, _ in client.calls)
+
+
+@pytest.mark.parametrize("entrypoint", ["wait", "preflight", "ensure"])
+def test_endpoint_deadline_rejects_ready_from_slow_read(monkeypatch, endpoint_clock, entrypoint):
+    client = FakeEndpointReadback()
+    client.endpoint = {"name": "release_1", "status": "READY", "liveVersion": "1", "targetVersion": "1"}
+    original_get = client.get_agent_runtime_endpoint
+
+    def slow_read(**kwargs):
+        endpoint_clock.now += 2
+        return original_get(**kwargs)
+
+    monkeypatch.setattr(client, "get_agent_runtime_endpoint", slow_read)
+    args = (client, client.current["agentRuntimeId"], "release_1")
+    with pytest.raises(deploy.DeploymentError, match="timed out"):
+        if entrypoint == "wait":
+            deploy.wait_endpoint(*args, "1", timeout=1)
+        elif entrypoint == "preflight":
+            deploy.check_release_endpoint(*args, client.current, configuration(), timeout=1)
+        else:
+            deploy.ensure_endpoint(*args, "1", timeout=1)
+    assert len(client.calls) == 1
+    assert not endpoint_clock.sleeps
+    assert all(op == "get-endpoint" for op, _ in client.calls)
+
+
+def test_manifest_verification_keeps_zero_timeout_single_read(tmp_path, monkeypatch, endpoint_clock):
+    client = FakeEndpointReadback()
+    manifest = perform_deploy(tmp_path, client)
+    client.calls.clear()
+    original_get = client.get_agent_runtime_endpoint
+
+    def slow_read(**kwargs):
+        endpoint_clock.now += 2
+        return original_get(**kwargs)
+
+    monkeypatch.setattr(client, "get_agent_runtime_endpoint", slow_read)
+    assert deploy.verify_manifest(client, manifest, "us-west-2")["status"] == "READY"
+    assert len([op for op, _ in client.calls if op == "get-endpoint"]) == 1
+    assert not endpoint_clock.sleeps
+
+
 def test_update_preserves_every_unspecified_field_and_unset_env(tmp_path):
     client = FakeControl()
     perform_deploy(tmp_path, client)
@@ -592,10 +932,10 @@ def test_waiter_deadline_even_if_ready_version_is_stale():
                             clock=lambda: next(times), sleep=lambda _: None)
 
 
-def test_endpoint_version_mismatch_deadline():
+def test_endpoint_version_conflict_fails_before_waiting():
     client = FakeControl()
     client.endpoint = {"name": "release_1", "status": "READY", "liveVersion": "1", "targetVersion": "2"}
-    with pytest.raises(deploy.DeploymentError, match="timed out"):
+    with pytest.raises(deploy.DeploymentError, match="immutable"):
         deploy.wait_endpoint(client, "openclaw_agent_v2-1234567890", "release_1", "2", timeout=0)
 
 

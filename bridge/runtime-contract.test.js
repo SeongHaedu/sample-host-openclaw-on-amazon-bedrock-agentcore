@@ -1505,6 +1505,37 @@ test("Cron creation rejects missing delivery metadata and cannot infer Telegram 
   }, ["telegram", "123"]), /channel must match the current conversation/);
 });
 
+for (const args of [["", ""], ["slack", ""], ["", "C789"], ["", "", "named reminder"], [null, null]]) {
+  test(`Cron optional delivery arguments use the current conversation: ${JSON.stringify(args)}`, async () => {
+    const identity = { actorId: "telegram:123", channel: "slack", channelActorId: "slack:U456", channelTarget: "C789" };
+    const { schedules, records } = await createCronForIdentity(identity, args);
+    assert.equal(schedules.length, 1);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].PK, "USER#u1");
+    for (const metadata of [JSON.parse(schedules[0].Target.Input), records[0]]) {
+      for (const [key, value] of Object.entries(identity)) assert.equal(metadata[key], value);
+    }
+  });
+}
+
+test("Cron optional empty arguments preserve owner and channel validation", async () => {
+  const identity = { actorId: "telegram:123", channel: "slack", channelActorId: "slack:U456", channelTarget: "C789" };
+  await assert.rejects(createCronForIdentity(identity, ["telegram", ""]), /channel must match the current conversation/);
+  await assert.rejects(createCronForIdentity(identity, [" ", ""]), /channel must match the current conversation/);
+  await assert.rejects(createCronForIdentity({ ...identity, actorId: "telegram:999" }, ["", ""]), /namespace does not match/);
+  await assert.rejects(createCronForIdentity({ ...identity, channelActorId: "telegram:123" }, ["", ""]), /delivery identity is unavailable/);
+});
+
+test("Cron optional empty target requires a valid conversation target", async () => {
+  const identity = { actorId: "telegram:123", channel: "slack", channelActorId: "slack:U456" };
+  for (const channelTarget of [undefined, null, "", false, 0, 123]) {
+    await assert.rejects(createCronForIdentity({ ...identity, channelTarget }, ["", ""]), /delivery target is unavailable/);
+  }
+  for (const channelTarget of [false, 0]) {
+    await assert.rejects(createCronForIdentity({ ...identity, channelTarget: "C789" }, ["slack", channelTarget]), /delivery target is unavailable/);
+  }
+});
+
 for (const channelTarget of [{ channelId: "C789" }, true, 123, ""]) {
   test(`rejects a non-string or empty delivery target before activation: ${JSON.stringify(channelTarget)}`, async (t) => {
     const app = loadContract(t);

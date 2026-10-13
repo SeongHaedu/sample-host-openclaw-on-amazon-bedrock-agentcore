@@ -44,11 +44,13 @@ def invoke_bounded(client_factory, parameters, deadline, max_response_bytes=500_
             body = response.get("response")
             chunks, total = [], 0
             if body and hasattr(body, "read"):
+                raw_stream = getattr(body, "_raw_stream", None)
                 while True:
                     remaining = io_deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("AgentCore Runtime response deadline elapsed")
-                    if hasattr(body, "set_socket_timeout"):
+                    # EOF closes urllib3's socket; still read to validate Content-Length.
+                    if hasattr(body, "set_socket_timeout") and not getattr(raw_stream, "closed", False):
                         body.set_socket_timeout(remaining)
                     chunk = body.read(min(65536, max_response_bytes + 1 - total))
                     if not chunk:

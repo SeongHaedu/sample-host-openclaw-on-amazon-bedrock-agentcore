@@ -201,7 +201,7 @@ function resolveScheduleDelivery(userId, { channel, channelTarget } = {}) {
   if (channel && channel !== identity.channel) {
     throw new Error("Schedule channel must match the current conversation");
   }
-  const target = channelTarget ?? identity.channelTarget;
+  const target = channelTarget === "" ? identity.channelTarget : (channelTarget ?? identity.channelTarget);
   if (typeof target !== "string" || !target) {
     throw new Error("Schedule delivery target is unavailable");
   }

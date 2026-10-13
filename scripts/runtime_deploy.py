@@ -218,51 +218,65 @@ def wait_runtime(client, runtime_id, expected_version=None, *, timeout=1800, int
 
 
 def wait_endpoint(client, runtime_id, name, expected_version, *, timeout=1800, interval=5,
-                  sleep=time.sleep, clock=time.monotonic):
-    deadline = clock() + timeout
+                  sleep=time.sleep, clock=time.monotonic, initial_endpoint=None, deadline=None):
+    deadline = clock() + timeout if deadline is None else deadline
+    endpoint = initial_endpoint
     while True:
-        try:
-            endpoint = client.get_agent_runtime_endpoint(agentRuntimeId=runtime_id, endpointName=name)
-        except ClientError as error:
-            if error.response["Error"]["Code"] != "ResourceNotFoundException":
-                raise
-            endpoint = {"status": "CREATING"}
+        if endpoint is None:
+            try:
+                endpoint = client.get_agent_runtime_endpoint(agentRuntimeId=runtime_id, endpointName=name)
+            except ClientError as error:
+                if error.response["Error"]["Code"] != "ResourceNotFoundException":
+                    raise
+                endpoint = {"status": "CREATING"}
         status = endpoint.get("status")
+        if status not in {"CREATING", "UPDATING", "READY"}:
+            raise DeploymentError(f"endpoint did not become READY: {status}")
+        # Missing versions can appear during creation; a different version is never this release.
+        if (endpoint.get("name", name) != name
+                or any(endpoint.get(key) not in {None, expected_version}
+                       for key in ("liveVersion", "targetVersion"))):
+            raise DeploymentError("V2 endpoints are immutable; choose a new --endpoint-name for this release")
+        remaining = deadline - clock()
+        # A zero timeout intentionally verifies one read; positive waits reject late READY responses.
+        if timeout > 0 and remaining <= 0:
+            raise DeploymentError("endpoint live/target version readback timed out")
         if (status == "READY" and endpoint.get("name") == name
                 and endpoint.get("liveVersion") == expected_version
                 and endpoint.get("targetVersion", expected_version) == expected_version):
             return endpoint
-        if status not in {"CREATING", "UPDATING", "READY"}:
-            raise DeploymentError(f"endpoint did not become READY: {status}")
-        if clock() >= deadline:
+        if remaining <= 0:
             raise DeploymentError("endpoint live/target version readback timed out")
-        sleep(interval)
+        sleep(min(interval, remaining))
+        endpoint = None
 
 
-def ensure_endpoint(client, runtime_id, name, runtime_version, *, timeout=1800, interval=5):
+def ensure_endpoint(client, runtime_id, name, runtime_version, *, timeout=1800, interval=5,
+                    deadline=None, previously_observed=False):
     if not NAME_PATTERN.fullmatch(name) or name == "DEFAULT":
         raise DeploymentError("V2 requires a custom immutable endpoint name")
+    deadline = time.monotonic() + timeout if deadline is None else deadline
     try:
         endpoint = client.get_agent_runtime_endpoint(agentRuntimeId=runtime_id, endpointName=name)
     except ClientError as error:
         if error.response["Error"]["Code"] != "ResourceNotFoundException":
             raise
+        if previously_observed:
+            raise DeploymentError("previously observed endpoint is missing; refusing to recreate") from error
         endpoint = None
     token = hashlib.sha256(f"{runtime_id}:{name}:{runtime_version}".encode()).hexdigest()
     if endpoint is None:
+        if timeout > 0 and time.monotonic() >= deadline:
+            raise DeploymentError("endpoint live/target version readback timed out")
         client.create_agent_runtime_endpoint(agentRuntimeId=runtime_id, name=name,
                                              agentRuntimeVersion=runtime_version, clientToken=token)
-    elif endpoint.get("status") in {"CREATING", "UPDATING"}:
-        wait_endpoint(client, runtime_id, name, endpoint["targetVersion"], timeout=timeout, interval=interval)
-        return ensure_endpoint(client, runtime_id, name, runtime_version, timeout=timeout, interval=interval)
-    elif endpoint.get("status") != "READY":
-        raise DeploymentError("existing endpoint is not READY")
-    elif endpoint.get("liveVersion") != runtime_version or endpoint.get("targetVersion", runtime_version) != runtime_version:
-        raise DeploymentError("V2 endpoints are immutable; choose a new --endpoint-name for this release")
-    return wait_endpoint(client, runtime_id, name, runtime_version, timeout=timeout, interval=interval)
+    return wait_endpoint(client, runtime_id, name, runtime_version, timeout=timeout, interval=interval,
+                         initial_endpoint=endpoint, deadline=deadline)
 
 
-def check_release_endpoint(client, runtime_id, name, current, desired):
+def check_release_endpoint(client, runtime_id, name, current, desired, *, timeout=1800, interval=5,
+                           deadline=None):
+    deadline = time.monotonic() + timeout if deadline is None else deadline
     try:
         endpoint = client.get_agent_runtime_endpoint(agentRuntimeId=runtime_id, endpointName=name)
     except ClientError as error:
@@ -270,10 +284,10 @@ def check_release_endpoint(client, runtime_id, name, current, desired):
             return
         raise
     changed = any(current.get(key) != value for key, value in desired.items())
-    if (changed or endpoint.get("status") != "READY"
-            or endpoint.get("liveVersion") != current["agentRuntimeVersion"]
-            or endpoint.get("targetVersion", current["agentRuntimeVersion"]) != current["agentRuntimeVersion"]):
+    if changed:
         raise DeploymentError("V2 endpoints are immutable; choose a new --endpoint-name for this release")
+    return wait_endpoint(client, runtime_id, name, current["agentRuntimeVersion"],
+                         timeout=timeout, interval=interval, initial_endpoint=endpoint, deadline=deadline)
 
 
 def validate_repository(name):
@@ -434,8 +448,14 @@ def deploy_runtime(client, invoke_client, *, manifest_path, region, platform="V2
     if not runtime_id or "requireServiceS3Endpoint" not in current.get("networkConfiguration", {}).get("networkModeConfig", {}):
         # Only round-trip this legacy flag for an existing runtime that returns it.
         desired.get("networkConfiguration", {}).get("networkModeConfig", {}).pop("requireServiceS3Endpoint", None)
+    endpoint_deadline = None
+    endpoint_observed = False
     if runtime_id:
-        check_release_endpoint(client, runtime_id, endpoint_name, current, desired)
+        endpoint_deadline = time.monotonic() + timeout
+        endpoint_observed = check_release_endpoint(
+            client, runtime_id, endpoint_name, current, desired, timeout=timeout,
+            deadline=endpoint_deadline,
+        ) is not None
     previous = copy.deepcopy(manifest)
     manifest = {
         "schemaVersion": 1, "region": region, "platformVersion": "V2",
@@ -445,6 +465,8 @@ def deploy_runtime(client, invoke_client, *, manifest_path, region, platform="V2
     }
     manifest["endpointPolicy"] = "IMMUTABLE"
     warmup_in_progress = False
+    preserve_previous = False
+    warmup_attempted = False
 
     def persist_pending_warmup(attempt):
         nonlocal warmup_in_progress
@@ -477,8 +499,13 @@ def deploy_runtime(client, invoke_client, *, manifest_path, region, platform="V2
         manifest.update(agentRuntimeId=runtime_id, agentRuntimeArn=current["agentRuntimeArn"],
                         agentRuntimeVersion=current["agentRuntimeVersion"],
                         configurationHash=configuration_hash(current))
-        write_manifest(manifest_path, manifest)
-        ensure_endpoint(client, runtime_id, endpoint_name, current["agentRuntimeVersion"], timeout=timeout)
+        # Keep read-only retries intact, including failures during final verification.
+        preserve_previous = all(previous.get(key) == manifest[key]
+                                for key in ("endpointName", "agentRuntimeVersion", "configurationHash"))
+        if not preserve_previous:
+            write_manifest(manifest_path, manifest)
+        ensure_endpoint(client, runtime_id, endpoint_name, current["agentRuntimeVersion"], timeout=timeout,
+                        deadline=endpoint_deadline, previously_observed=endpoint_observed)
         if skip_warmup:
             manifest["warmup"] = {"mode": "chat", "status": "skipped", "reason": "explicit --skip-warmup"}
         elif (previous.get("configurationHash") == manifest["configurationHash"]
@@ -488,6 +515,7 @@ def deploy_runtime(client, invoke_client, *, manifest_path, region, platform="V2
               and has_v2_warmup_evidence(previous["warmup"])):
             manifest["warmup"] = previous["warmup"]
         else:
+            warmup_attempted = True
             manifest["warmup"] = run_warmup(invoke_client, current["agentRuntimeArn"], endpoint_name,
                                           runtime_version=current["agentRuntimeVersion"],
                                           before_invoke=persist_pending_warmup)
@@ -496,7 +524,7 @@ def deploy_runtime(client, invoke_client, *, manifest_path, region, platform="V2
         write_manifest(manifest_path, manifest)
         return manifest
     except Exception as error:
-        if runtime_id:
+        if runtime_id and (not preserve_previous or warmup_attempted):
             manifest.setdefault("agentRuntimeId", runtime_id)
             status = "unknown" if warmup_in_progress and not isinstance(error, WarmupError) else "failed"
             manifest["warmup"].update(status=status, errorType=type(error).__name__)
